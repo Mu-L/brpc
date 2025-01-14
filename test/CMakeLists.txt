@@ -31,6 +31,7 @@ set(TEST_PROTO_FILES addressbook1.proto
                      snappy_message.proto
                      v1.proto
                      v2.proto
+                     v3.proto
                      grpc.proto
                      health_check.proto)
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/test/hdrs)
@@ -173,7 +174,8 @@ SET(TEST_BUTIL_SOURCES
     ${PROJECT_SOURCE_DIR}/test/object_pool_unittest.cpp
     ${PROJECT_SOURCE_DIR}/test/test_switches.cc
     ${PROJECT_SOURCE_DIR}/test/scoped_locale.cc
-    ${PROJECT_SOURCE_DIR}/test/butil_unittest_main.cpp
+    ${PROJECT_SOURCE_DIR}/test/scope_guard_unittest.cpp
+    ${PROJECT_SOURCE_DIR}/test/optional_unittest.cpp
     ${PROJECT_SOURCE_DIR}/test/butil_unittest_main.cpp
 	)
 

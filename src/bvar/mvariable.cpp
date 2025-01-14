@@ -75,7 +75,9 @@ struct MVarMapWithLock : public MVarMap {
     pthread_mutex_t mutex;
 
     MVarMapWithLock() {
-        CHECK_EQ(0, init(256, 80));
+        if (init(256) != 0) {
+            LOG(WARNING) << "Fail to init";
+        }
         pthread_mutex_init(&mutex, NULL);
     }
 };
@@ -259,13 +261,13 @@ size_t MVariable::dump_exposed(Dumper* dumper, const DumpOptions* options) {
         if (entry) {
             n += entry->var->dump(dumper, &opt);
         }
-	if (n > static_cast<size_t>(FLAGS_bvar_max_dump_multi_dimension_metric_number)) {
+        if (n > static_cast<size_t>(FLAGS_bvar_max_dump_multi_dimension_metric_number)) {
             LOG(WARNING) << "truncated because of \
-		            exceed max dump multi dimension label number["
-			 << FLAGS_bvar_max_dump_multi_dimension_metric_number
-			 << "]";
+                            exceed max dump multi dimension label number["
+                         << FLAGS_bvar_max_dump_multi_dimension_metric_number
+                         << "]";
             break;
-	}
+        }
     }
     return n;
 }

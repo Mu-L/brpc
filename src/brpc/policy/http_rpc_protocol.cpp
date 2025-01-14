@@ -710,30 +710,33 @@ public:
     HttpResponseSender()
         : HttpResponseSender(NULL) {}
     explicit HttpResponseSender(Controller* cntl/*own*/)
-        : _cntl(cntl), _method_status(NULL), _received_us(0), _h2_stream_id(-1) {}
+        : _cntl(cntl)
+        , _messages(NULL)
+        , _method_status(NULL)
+        , _received_us(0)
+        , _h2_stream_id(-1) {}
+
     HttpResponseSender(HttpResponseSender&& s) noexcept
         : _cntl(std::move(s._cntl))
-        , _req(std::move(s._req))
-        , _res(std::move(s._res))
+        , _messages(s._messages)
         , _method_status(s._method_status)
         , _received_us(s._received_us)
         , _h2_stream_id(s._h2_stream_id) {
+        s._messages = NULL;
         s._method_status = NULL;
         s._received_us = 0;
         s._h2_stream_id = -1;
     }
     ~HttpResponseSender();
 
-    void own_request(google::protobuf::Message* req) { _req.reset(req); }
-    void own_response(google::protobuf::Message* res) { _res.reset(res); }
+    void set_messages(RpcPBMessages* messages) { _messages = messages; }
     void set_method_status(MethodStatus* ms) { _method_status = ms; }
     void set_received_us(int64_t t) { _received_us = t; }
     void set_h2_stream_id(int id) { _h2_stream_id = id; }
 
 private:
     std::unique_ptr<Controller, LogErrorTextAndDelete> _cntl;
-    std::unique_ptr<google::protobuf::Message> _req;
-    std::unique_ptr<google::protobuf::Message> _res;
+    RpcPBMessages* _messages;
     MethodStatus* _method_status;
     int64_t _received_us;
     int _h2_stream_id;
@@ -743,7 +746,8 @@ class HttpResponseSenderAsDone : public google::protobuf::Closure {
 public:
     explicit HttpResponseSenderAsDone(HttpResponseSender* s) : _sender(std::move(*s)) {}
     void Run() override {
-        _sender._cntl->CallAfterRpcResp(_sender._req.get(), _sender._res.get());
+        _sender._cntl->CallAfterRpcResp(
+            _sender._messages->Request(), _sender._messages->Response());
         delete this;
     }
 
@@ -752,6 +756,12 @@ private:
 };
 
 HttpResponseSender::~HttpResponseSender() {
+    // Return messages to factory at the end.
+    BRPC_SCOPE_EXIT {
+        if (NULL != _messages) {
+            _cntl->server()->options().rpc_pb_message_factory->Return(_messages);
+        }
+    };
     Controller* cntl = _cntl.get();
     if (cntl == NULL) {
         return;
@@ -763,7 +773,7 @@ HttpResponseSender::~HttpResponseSender() {
     }
     ConcurrencyRemover concurrency_remover(_method_status, cntl, _received_us);
     Socket* socket = accessor.get_sending_socket();
-    const google::protobuf::Message* res = _res.get();
+    const google::protobuf::Message* res = NULL != _messages ? _messages->Response() : NULL;
     
     if (cntl->IsCloseConnection()) {
         socket->SetFailed();
@@ -1253,6 +1263,26 @@ ParseResult ParseHttpMessage(butil::IOBuf *source, Socket *socket,
     }
 }
 
+static void SendUnauthorizedResponse(const std::string& user_error_text, Socket* socket) {
+    // Send 403(forbidden) to client.
+    HttpHeader header;
+    header.set_status_code(HTTP_STATUS_FORBIDDEN);
+    butil::IOBuf content;
+    content.append(butil::string_printf("[%d]", ERPCAUTH));
+    content.append("Fail to authenticate");
+    if (!user_error_text.empty()) {
+        content.append(": ");
+        content.append(user_error_text);
+    }
+    butil::IOBuf res_buf;
+    MakeRawHttpResponse(&res_buf, &header, &content);
+    Socket::WriteOptions opt;
+    opt.ignore_eovercrowded = true;
+    if (socket->Write(&res_buf, &opt) != 0) {
+        PLOG_IF(WARNING, errno != EPIPE) << "Fail to write into " << *socket;
+    }
+}
+
 bool VerifyHttpRequest(const InputMessageBase* msg) {
     Server* server = (Server*)msg->arg();
     Socket* socket = msg->socket();
@@ -1265,8 +1295,7 @@ bool VerifyHttpRequest(const InputMessageBase* msg) {
     }
     const Server::MethodProperty* mp = FindMethodPropertyByURI(
         http_request->header().uri().path(), server, NULL);
-    if (mp != NULL &&
-        mp->is_builtin_service &&
+    if (mp != NULL && mp->is_builtin_service &&
         mp->service->GetDescriptor() != BadMethodService::descriptor()) {
         // BuiltinService doesn't need authentication
         // TODO: Fix backdoor that sends BuiltinService at first
@@ -1275,16 +1304,22 @@ bool VerifyHttpRequest(const InputMessageBase* msg) {
     }
 
     const std::string *authorization 
-        = http_request->header().GetHeader("Authorization");
+        = http_request->header().GetHeader(common->AUTHORIZATION);
     if (authorization == NULL) {
+        SendUnauthorizedResponse(auth->GetUnauthorizedErrorText(), socket);
         return false;
     }
     butil::EndPoint user_addr;
     if (!GetUserAddressFromHeader(http_request->header(), &user_addr)) {
         user_addr = socket->remote_side();
     }
-    return auth->VerifyCredential(*authorization, user_addr,
-                                  socket->mutable_auth_context()) == 0;
+    if (auth->VerifyCredential(*authorization, user_addr,
+                               socket->mutable_auth_context()) != 0) {
+        SendUnauthorizedResponse(auth->GetUnauthorizedErrorText(), socket);
+        return false;
+    }
+
+    return true;
 }
 
 
@@ -1460,7 +1495,9 @@ void ProcessHttpRequest(InputMessageBase *msg) {
     // NOTE: accesses to builtin services are not counted as part of
     // concurrency, therefore are not limited by ServerOptions.max_concurrency.
     if (!sp->is_builtin_service && !sp->params.is_tabbed) {
-        if (socket->is_overcrowded()) {
+        if (socket->is_overcrowded() &&
+            !server->options().ignore_eovercrowded &&
+            !sp->ignore_eovercrowded) {
             cntl->SetFailed(EOVERCROWDED, "Connection to %s is overcrowded",
                             butil::endpoint2str(socket->remote_side()).c_str());
             return;
@@ -1488,10 +1525,10 @@ void ProcessHttpRequest(InputMessageBase *msg) {
     google::protobuf::Service* svc = sp->service;
     const google::protobuf::MethodDescriptor* method = sp->method;
     accessor.set_method(method);
-    google::protobuf::Message* req = svc->GetRequestPrototype(method).New();
-    resp_sender.own_request(req);
-    google::protobuf::Message* res = svc->GetResponsePrototype(method).New();
-    resp_sender.own_response(res);
+    RpcPBMessages* messages = server->options().rpc_pb_message_factory->Get(*svc, *method);;
+    resp_sender.set_messages(messages);
+    google::protobuf::Message* req = messages->Request();
+    google::protobuf::Message* res = messages->Response();
 
     if (__builtin_expect(!req || !res, 0)) {
         PLOG(FATAL) << "Fail to new req or res";
@@ -1578,15 +1615,17 @@ void ProcessHttpRequest(InputMessageBase *msg) {
                 }
             }
         }
-        SampledRequest* sample = AskToBeSampled();
-        if (sample && !is_http2) {
-            sample->meta.set_compress_type(COMPRESS_TYPE_NONE);
-            sample->meta.set_protocol_type(PROTOCOL_HTTP);
-            sample->meta.set_attachment_size(req_body.size());
+        if (!is_http2) {
+            SampledRequest* sample = AskToBeSampled();
+            if (sample) {
+                sample->meta.set_compress_type(COMPRESS_TYPE_NONE);
+                sample->meta.set_protocol_type(PROTOCOL_HTTP);
+                sample->meta.set_attachment_size(req_body.size());
 
-            butil::EndPoint ep;
-            MakeRawHttpRequest(&sample->request, &req_header, ep, &req_body);
-            sample->submit(start_parse_us);
+                butil::EndPoint ep;
+                MakeRawHttpRequest(&sample->request, &req_header, ep, &req_body);
+                sample->submit(start_parse_us);
+            }
         }
     } else {
         if (imsg_guard->read_body_progressively()) {
